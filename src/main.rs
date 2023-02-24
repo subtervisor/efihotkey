@@ -1,10 +1,15 @@
+use std::{
+    fs::OpenOptions,
+    io::{Read, Write},
+    os::fd::AsRawFd,
+};
+
 use bimap::BiMap;
 use binread::{until_eof, BinRead, BinReaderExt};
 use binwrite::BinWrite;
 use bitfield::bitfield;
 use clap::{Parser, ValueEnum};
 use crc32fast::hash as crc32;
-use efivar::efi::{VariableFlags, VariableName, VariableVendor};
 
 #[derive(ValueEnum, Clone, Debug, PartialEq, PartialOrd)]
 enum KeyOperation {
@@ -14,8 +19,35 @@ enum KeyOperation {
     Delete,
 }
 
-static mut EFI_SCAN_CODES: Option<BiMap<&'static str, u16>> = None;
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// Name of the Boot variable to boot
+    #[arg(long, short)]
+    boot_variable: Option<String>,
 
+    /// Key combination to use
+    #[arg(long, short)]
+    variable: Option<String>,
+
+    /// Key combination to use. Can be specified multiple times for multiple keys.
+    #[arg(long, short)]
+    key: Vec<String>,
+
+    /// Ignore BootOptionSupport variable settings. Can be useful if your EFI
+    /// implementation is buggy and doesn't correctly report this.
+    #[arg(long)]
+    ignore_support: bool,
+
+    /// Add a key shortcut
+    #[arg(short, long, value_enum, default_value_t = KeyOperation::Get)]
+    operation: KeyOperation,
+}
+
+static EFIVARFS_PATH: &'static str = "/sys/firmware/efi/efivars";
+static EFIVAR_SUFFIX: &'static str = "-8be4df61-93ca-11d2-aa0d-00e098032b8c";
+
+static mut EFI_SCAN_CODES: Option<BiMap<&'static str, u16>> = None;
 fn init_scan_codes() {
     unsafe {
         EFI_SCAN_CODES = Some(BiMap::from_iter(vec![
@@ -69,7 +101,6 @@ fn init_scan_codes() {
         ]));
     }
 }
-
 fn get_scan_code_name(code: &u16) -> &str {
     let codes = unsafe {
         EFI_SCAN_CODES
@@ -83,7 +114,6 @@ fn get_scan_code_name(code: &u16) -> &str {
     codes.insert(key_fmt, *code);
     key_fmt
 }
-
 fn get_scan_code(name: &str) -> Option<&u16> {
     unsafe {
         EFI_SCAN_CODES
@@ -91,31 +121,6 @@ fn get_scan_code(name: &str) -> Option<&u16> {
             .expect("EFI Scan Codes uninitialized!")
             .get_by_left(name)
     }
-}
-
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
-struct Args {
-    /// Name of the Boot variable to boot
-    #[arg(long, short)]
-    boot_variable: Option<String>,
-
-    /// Key combination to use
-    #[arg(long, short)]
-    variable: Option<String>,
-
-    /// Key combination to use. Can be specified multiple times for multiple keys.
-    #[arg(long, short)]
-    key: Vec<String>,
-
-    /// Ignore BootOptionSupport variable settings. Can be useful if your EFI
-    /// implementation is buggy and doesn't correctly report this.
-    #[arg(long)]
-    ignore_support: bool,
-
-    /// Add a key shortcut
-    #[arg(short, long, value_enum, default_value_t = KeyOperation::Get)]
-    operation: KeyOperation,
 }
 
 fn is_hexnum(c: char) -> bool {
@@ -361,50 +366,58 @@ fn parse_hotkeys(
     Some((key_data, keys))
 }
 
-fn get_var(sys_vars: &Box<dyn efivar::VarManager>, name: &VariableName) -> Option<Vec<u8>> {
-    let mut buf_size: usize = 4096;
-    let mut buf = Vec::with_capacity(buf_size);
-    unsafe {
-        buf.set_len(buf_size);
+fn get_var(name: &str) -> Option<Vec<u8>> {
+    let mut var_name = name.to_string();
+    var_name.push_str(EFIVAR_SUFFIX);
+    let var_path = std::path::PathBuf::from(EFIVARFS_PATH).join(var_name);
+    if let Ok(mut f) = OpenOptions::new()
+        .read(true)
+        .write(false)
+        .append(false)
+        .create(false)
+        .open(&var_path)
+    {
+        let mut dummy = [0u8, 0u8, 0u8, 0u8];
+        f.read(&mut dummy).ok()?;
+        let mut v = Vec::new();
+        f.read_to_end(&mut v).ok()?;
+        Some(v)
+    } else {
+        None
     }
-
-    loop {
-        match sys_vars.read(&name, buf.as_mut_slice()) {
-            Err(e) => match e {
-                efivar::Error::BufferTooSmall { name: _ } => {
-                    buf_size = buf_size + 4096;
-                    println!("Resizing to {}", buf_size);
-                    buf.reserve(buf_size);
-                    unsafe {
-                        buf.set_len(buf_size);
-                    }
-                }
-                e => {
-                    eprintln!("Getting variable failed: {}", e);
-                    return None;
-                }
-            },
-            Ok(info) => unsafe {
-                buf.set_len(info.0);
-                break;
-            },
-        }
-    }
-    Some(buf)
 }
 
-fn get_hotkey_support_info(
-    sys_vars: &Box<dyn efivar::VarManager>,
-    ignore_boot_support: bool,
-) -> EfiBootSupport {
+fn get_vars() -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(EFIVARFS_PATH).ok()? {
+        let entry = entry.ok()?;
+        if entry
+            .file_name()
+            .to_str()
+            .unwrap_or_default()
+            .ends_with(EFIVAR_SUFFIX)
+        {
+            out.push(
+                entry
+                    .file_name()
+                    .to_str()
+                    .unwrap()
+                    .trim_end_matches(EFIVAR_SUFFIX)
+                    .to_string(),
+            );
+        }
+    }
+    Some(out)
+}
+
+fn get_hotkey_support_info(ignore_boot_support: bool) -> EfiBootSupport {
     if ignore_boot_support {
         return EfiBootSupport(0xffff);
     }
 
     let var_str = String::from("BootOptionSupport");
-    if check_var_exists(sys_vars, &var_str) {
-        let var_name = VariableName::new_with_vendor(&var_str, VariableVendor::Efi);
-        if let Some(data) = get_var(sys_vars, &var_name) {
+    if check_var_exists(&var_str) {
+        if let Some(data) = get_var(&var_str) {
             let mut reader = std::io::Cursor::new(&data);
             if let Ok(key_option) = reader.read_le::<u32>() {
                 return EfiBootSupport(key_option);
@@ -415,7 +428,6 @@ fn get_hotkey_support_info(
 }
 
 fn show_key_info(
-    sys_vars: &Box<dyn efivar::VarManager>,
     boot_var: Option<String>,
     key_var: Option<String>,
     hotkeys: Option<(EfiBootKeyData, Vec<EfiKey>)>,
@@ -430,28 +442,27 @@ fn show_key_info(
     if !overridden {
         println!("Boot Support Info: {}", support_info);
     } else {
-        let support_info_real = get_hotkey_support_info(sys_vars, false);
+        let support_info_real = get_hotkey_support_info(false);
         println!("Boot Support Info (Fake): {}", support_info);
         println!("Boot Support Info (Actual): {}", support_info_real);
     }
 
-    let boot_vars = sys_vars
-        .get_var_names()
-        .expect("Failed to get variable names")
+    let boot_vars = get_vars().expect("Failed to get variable names");
+    let boot_vars = boot_vars
+        .iter()
         .filter(|v| {
-            let sn = v.short_name();
-            return sn.len() == 8 && sn.starts_with("Boot") && sn[4..].chars().all(is_hexnum);
+            return v.len() == 8 && v.starts_with("Boot") && v[4..].chars().all(is_hexnum);
         })
         .filter_map(|n| {
-            let buf = get_var(&sys_vars, &n).expect("Failed to get variable");
+            let buf = get_var(n).expect("Failed to get variable");
             let mut reader = std::io::Cursor::new(&buf);
             let info = reader.read_le::<EfiLoadOption>();
             if info.is_err() {
-                eprint!("Failed to parse {}", n.short_name());
+                eprintln!("Failed to parse {}", n);
                 return None;
             }
             let info = info.unwrap();
-            Some((n.short_name(), info.description))
+            Some((n, info.description))
         })
         .collect::<Vec<_>>();
 
@@ -464,22 +475,21 @@ fn show_key_info(
     }
     println!();
     if support_info.get_hotkeys_supported() == 1 {
-        let key_vars = sys_vars
-            .get_var_names()
-            .expect("Failed to get variable names")
+        let key_vars = get_vars().expect("Failed to get variable names");
+        let key_vars = key_vars
+            .iter()
             .filter(|v| {
-                let sn = v.short_name();
                 if key_var.is_some() {
-                    return key_var.as_ref().unwrap() == &sn;
+                    return key_var.as_ref().unwrap() == *v;
                 }
-                return sn.len() == 7 && sn.starts_with("Key") && sn[3..].chars().all(is_hexnum);
+                return v.len() == 7 && v.starts_with("Key") && v[3..].chars().all(is_hexnum);
             })
             .filter_map(|n| {
-                let buf = get_var(&sys_vars, &n).expect("Failed to get variable");
+                let buf = get_var(n).expect("Failed to get variable");
                 let mut reader = std::io::Cursor::new(&buf);
                 let key_option = reader.read_le::<EfiKeyOption>();
                 if key_option.is_err() {
-                    eprint!("Failed to parse {}", n.short_name());
+                    eprintln!("Failed to parse {}", n);
                     return None;
                 }
                 let key_option = key_option.unwrap();
@@ -494,14 +504,14 @@ fn show_key_info(
                         return None;
                     }
                 }
-                Some((n.short_name(), (n, key_option)))
+                Some((n, key_option))
             })
             .collect::<Vec<_>>();
 
         println!("Hotkeys:");
 
         for p in key_vars.iter() {
-            println!("- {}: {}", p.0, p.1 .1);
+            println!("- {}: {}", p.0, p.1);
         }
         if key_vars.is_empty() {
             if boot_var.is_none() && key_var.is_none() && hotkeys.is_none() {
@@ -515,23 +525,61 @@ fn show_key_info(
     }
 }
 
-fn check_var_exists(sys_vars: &Box<dyn efivar::VarManager>, var: &String) -> bool {
-    let var_name = VariableName::new_with_vendor(var, VariableVendor::Efi);
-    let mut dummy = [0u8];
-    match sys_vars.read(&var_name, &mut dummy) {
-        Ok(_) => return true,
-        Err(e) => match e {
-            efivar::Error::BufferTooSmall { name: _ } => return true,
-            efivar::Error::PermissionDenied { name: _ } => return true,
-            _ => return false,
-        },
-    }
+fn efi_var_path(var: &str) -> std::path::PathBuf {
+    let mut var_filename = var.to_string();
+    var_filename.push_str(EFIVAR_SUFFIX);
+    std::path::PathBuf::from(EFIVARFS_PATH).join(var_filename)
 }
-fn delete_hotkey(
-    sys_vars: &mut Box<dyn efivar::VarManager>,
-    key_var: String,
-    support_info: &EfiBootSupport,
-) {
+
+fn check_var_exists(var: &str) -> bool {
+    efi_var_path(var).exists()
+}
+
+use libc::c_ulong;
+use nix::{ioctl_read, ioctl_write_ptr};
+
+const FS_IOC_GETFLAGS_MAGIC: u8 = b'f';
+const FS_IOC_GETFLAGS_MODE: u8 = 1;
+const FS_IOC_SETFLAGS_MODE: u8 = 2;
+ioctl_read!(
+    fs_get_flags,
+    FS_IOC_GETFLAGS_MAGIC,
+    FS_IOC_GETFLAGS_MODE,
+    c_ulong
+);
+
+ioctl_write_ptr!(
+    fs_set_flags,
+    FS_IOC_GETFLAGS_MAGIC,
+    FS_IOC_SETFLAGS_MODE,
+    c_ulong
+);
+
+fn try_delete_var(name: &str, write: bool) -> bool {
+    let var_path = efi_var_path(&name);
+    if let Ok(f) = OpenOptions::new()
+        .read(!write)
+        .write(write)
+        .append(false)
+        .create(false)
+        .open(&var_path)
+    {
+        unsafe {
+            let mut attribs = 0;
+            if let Ok(_) = fs_get_flags(f.as_raw_fd(), &mut attribs) {
+                if attribs & 0x00000010 != 0 {
+                    let new_attribs = attribs & !0x00000010;
+                    if let Err(e) = fs_set_flags(f.as_raw_fd(), &new_attribs) {
+                        eprintln!("Failed to make variable mutable: {}", e);
+                    }
+                }
+            }
+        }
+    }
+    std::fs::remove_file(var_path).is_ok()
+}
+
+fn delete_hotkey(key_var: String, support_info: &EfiBootSupport) {
     if support_info.get_hotkeys_supported() == 0 {
         eprintln!("Hotkeys are not supported!");
         return;
@@ -543,16 +591,14 @@ fn delete_hotkey(
         format!("Key{}", key_var)
     };
 
-    let var_name = VariableName::new_with_vendor(&key_var, VariableVendor::Efi);
-    let empty = [];
-    if let Err(e) = sys_vars.write(&var_name, VariableFlags::empty(), &empty) {
-        eprintln!("Failed to remove {}: {}", key_var, e);
-        std::process::exit(-4);
+    if check_var_exists(&key_var) {
+        if !try_delete_var(&key_var, false) && !try_delete_var(&key_var, true) {
+            eprintln!("Failed to delete!");
+        }
     }
 }
 
 fn edit_hotkey(
-    sys_vars: &mut Box<dyn efivar::VarManager>,
     boot_var: Option<String>,
     key_var: String,
     hotkeys: Option<(EfiBootKeyData, Vec<EfiKey>)>,
@@ -569,7 +615,7 @@ fn edit_hotkey(
         return;
     }
 
-    if !check_var_exists(&sys_vars, &key_var) {
+    if !check_var_exists(&key_var) {
         eprintln!("{} does not exist!", key_var);
         std::process::exit(-2);
     }
@@ -585,9 +631,7 @@ fn edit_hotkey(
             format!("Boot{}", boot_var)
         };
 
-        let bootvar_name = VariableName::new_with_vendor(&boot_var, VariableVendor::Efi);
-
-        let buf = get_var(sys_vars, &bootvar_name);
+        let buf = get_var(&boot_var);
         if buf.is_none() {
             eprintln!("Failed to get {}!", boot_var);
             std::process::exit(-2);
@@ -597,12 +641,11 @@ fn edit_hotkey(
         (boot_var_u16, boot_var_crc, buf)
     });
 
-    let var_name = VariableName::new_with_vendor(&key_var, VariableVendor::Efi);
-    let buf = get_var(&sys_vars, &var_name).expect("Failed to get key variable");
+    let buf = get_var(&key_var).expect("Failed to get key variable");
     let mut reader = std::io::Cursor::new(&buf);
     let key_option = reader.read_le::<EfiKeyOption>();
     if key_option.is_err() {
-        eprint!("Failed to parse {}", key_var);
+        eprintln!("Failed to parse {}", key_var);
         std::process::exit(-3);
     }
     let mut key_option = key_option.unwrap();
@@ -629,20 +672,74 @@ fn edit_hotkey(
         std::process::exit(-3);
     }
 
-    if let Err(e) = sys_vars.write(
-        &var_name,
-        VariableFlags::BOOTSERVICE_ACCESS
-            | VariableFlags::NON_VOLATILE
-            | VariableFlags::RUNTIME_ACCESS,
-        &key_bytes,
-    ) {
-        eprintln!("Failed to save {}: {}", key_var, e);
-        std::process::exit(-4);
+    let var_path = efi_var_path(&key_var);
+    let mut original_attribs = None;
+    let mut attrib_fd = None;
+    if let Ok(f) = OpenOptions::new()
+        .read(true)
+        .write(false)
+        .append(false)
+        .create(false)
+        .open(&var_path)
+    {
+        unsafe {
+            let mut attribs = 0;
+            if let Ok(_) = fs_get_flags(f.as_raw_fd(), &mut attribs) {
+                if attribs & 0x00000010 != 0 {
+                    let new_attribs = attribs & !0x00000010;
+                    if let Err(e) = fs_set_flags(f.as_raw_fd(), &new_attribs) {
+                        eprintln!("Failed to make variable mutable: {}", e);
+                    } else {
+                        original_attribs = Some(attribs);
+                        attrib_fd = Some(f);
+                    }
+                }
+            }
+        }
+    }
+
+    if let Ok(mut f) = OpenOptions::new()
+        .read(false)
+        .write(true)
+        .append(false)
+        .create(false)
+        .open(&var_path)
+    {
+        unsafe {
+            let mut attribs = 0;
+            if let Ok(_) = fs_get_flags(f.as_raw_fd(), &mut attribs) {
+                if attribs & 0x00000010 != 0 {
+                    let new_attribs = attribs & !0x00000010;
+                    if let Err(e) = fs_set_flags(f.as_raw_fd(), &new_attribs) {
+                        eprintln!("Failed to make variable mutable: {}", e);
+                        return;
+                    } else {
+                        original_attribs = Some(attribs);
+                        attrib_fd = None;
+                    }
+                }
+            }
+        }
+
+        let mut buf = (0x00000007 as u32).to_le_bytes().to_vec();
+        buf.append(&mut key_bytes);
+        if let Err(e) = f.write_all(&mut buf) {
+            eprintln!("Failed to write var: {}", e);
+        }
+
+        if original_attribs.is_some() {
+            let mut original_attribs = original_attribs.unwrap();
+            let f = attrib_fd.unwrap_or(f);
+            unsafe {
+                if let Err(e) = fs_set_flags(f.as_raw_fd(), &mut original_attribs) {
+                    eprintln!("Failed to make variable immutable: {}", e);
+                }
+            }
+        }
     }
 }
 
 fn add_hotkey(
-    sys_vars: &mut Box<dyn efivar::VarManager>,
     boot_var: String,
     key_var: Option<String>,
     hotkeys: (EfiBootKeyData, Vec<EfiKey>),
@@ -662,7 +759,7 @@ fn add_hotkey(
     }
 
     if let Some(key_var) = key_var.as_ref() {
-        if check_var_exists(sys_vars, key_var) {
+        if check_var_exists(key_var) {
             eprintln!("Key variable {} already exists!", key_var);
             std::process::exit(-2);
         }
@@ -678,9 +775,7 @@ fn add_hotkey(
         format!("Boot{}", boot_var)
     };
 
-    let bootvar_name = VariableName::new_with_vendor(&boot_var, VariableVendor::Efi);
-
-    let buf = get_var(sys_vars, &bootvar_name);
+    let buf = get_var(&boot_var);
     if buf.is_none() {
         eprintln!("Failed to get {}!", boot_var);
         std::process::exit(-2);
@@ -703,29 +798,33 @@ fn add_hotkey(
         let mut idx: u16 = 0;
         loop {
             let candidate = format!("Key{:04x}", idx);
-            if !check_var_exists(sys_vars, &candidate) {
+            if !check_var_exists(&candidate) {
                 return candidate;
             }
             idx += 1;
         }
     });
     println!("Saving hotkey: {}", hotkey_info);
-    let key_var_name = VariableName::new_with_vendor(&key_var_name_str, VariableVendor::Efi);
     let mut key_bytes = vec![];
     if let Err(e) = hotkey_info.write(&mut key_bytes) {
         eprintln!("Failed to encode hotkey struct: {}", e);
         std::process::exit(-3);
     }
 
-    if let Err(e) = sys_vars.write(
-        &key_var_name,
-        VariableFlags::BOOTSERVICE_ACCESS
-            | VariableFlags::NON_VOLATILE
-            | VariableFlags::RUNTIME_ACCESS,
-        &key_bytes,
-    ) {
-        eprintln!("Failed to save {}: {}", key_var_name_str, e);
-        std::process::exit(-4);
+    let var_path = efi_var_path(&key_var_name_str);
+
+    if let Ok(mut f) = OpenOptions::new()
+        .read(false)
+        .write(true)
+        .append(false)
+        .create(true)
+        .open(var_path)
+    {
+        let mut buf = (0x00000007 as u32).to_le_bytes().to_vec();
+        buf.append(&mut key_bytes);
+        if let Err(e) = f.write_all(&mut buf) {
+            eprintln!("Failed to write var: {}", e);
+        }
     }
 }
 
@@ -755,8 +854,7 @@ fn main() {
         }
     }
 
-    let mut sys_vars = efivar::system();
-    let support_info = get_hotkey_support_info(&sys_vars, args.ignore_support);
+    let support_info = get_hotkey_support_info(args.ignore_support);
 
     let hotkeys = parse_hotkeys(&args.key, &support_info);
     if hotkeys.is_none() && !args.key.is_empty() {
@@ -767,7 +865,6 @@ fn main() {
     match args.operation {
         KeyOperation::Get => {
             show_key_info(
-                &sys_vars,
                 args.boot_variable,
                 args.variable,
                 hotkeys,
@@ -783,20 +880,12 @@ fn main() {
                 std::process::exit(-1);
             }
             add_hotkey(
-                &mut sys_vars,
                 args.boot_variable.unwrap(),
                 args.variable,
                 hotkeys.unwrap(),
                 &support_info,
             );
-            show_key_info(
-                &sys_vars,
-                None,
-                None,
-                None,
-                support_info,
-                args.ignore_support,
-            );
+            show_key_info(None, None, None, support_info, args.ignore_support);
         }
         KeyOperation::Edit => {
             if args.boot_variable.is_none() && hotkeys.is_none() {
@@ -808,20 +897,12 @@ fn main() {
                 std::process::exit(-1);
             }
             edit_hotkey(
-                &mut sys_vars,
                 args.boot_variable,
                 args.variable.unwrap(),
                 hotkeys,
                 &support_info,
             );
-            show_key_info(
-                &sys_vars,
-                None,
-                None,
-                None,
-                support_info,
-                args.ignore_support,
-            );
+            show_key_info(None, None, None, support_info, args.ignore_support);
         }
         KeyOperation::Delete => {
             if args.boot_variable.is_some() || hotkeys.is_some() {
@@ -832,15 +913,8 @@ fn main() {
                 eprintln!("Key variable required for deletion.");
                 std::process::exit(-1);
             }
-            delete_hotkey(&mut sys_vars, args.variable.unwrap(), &support_info);
-            show_key_info(
-                &sys_vars,
-                None,
-                None,
-                None,
-                support_info,
-                args.ignore_support,
-            );
+            delete_hotkey(args.variable.unwrap(), &support_info);
+            show_key_info(None, None, None, support_info, args.ignore_support);
         }
     }
 }
